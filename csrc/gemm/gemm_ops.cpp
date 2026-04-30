@@ -48,6 +48,10 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // Generic PyTorch grouped GEMM API is only available on AMD for now.
   m.def(
       "f8f8bf16_rowwise_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? offsets, Tensor(a!) output) -> Tensor");
+  // INT8 GEMM via Triton (BACKLOG-G1 / MSLK-G1) — static and dynamic scale variants.
+  m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
+  m.def(
+      "i8i8bf16_dynamic(Tensor XQ, Tensor WQ, Tensor scale, int split_k=1) -> Tensor");
 #else
   m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
   m.def(
@@ -111,6 +115,8 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
+  // i8i8bf16 / i8i8bf16_dynamic: dispatched to Python Triton kernels via
+  // torch.library.impl registered in mslk/gemm/triton/int8_gemm.py.
 #else
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
@@ -159,6 +165,7 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
+  // i8i8bf16 / i8i8bf16_dynamic: Python Triton dispatch; no CPU fallback needed.
 #else
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
@@ -189,6 +196,17 @@ at::Tensor i8i8bf16_meta(
     at::Tensor WQ, // INT8
     double scale,
     int64_t split_k) {
+  const at::SymInt M = XQ.sym_size(0);
+  const at::SymInt N = WQ.sym_size(0);
+  auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
+  return Y;
+}
+
+at::Tensor i8i8bf16_dynamic_meta(
+    at::Tensor XQ, // INT8
+    at::Tensor WQ, // INT8
+    at::Tensor /* scale */, // float32 scalar tensor
+    int64_t /* split_k */) {
   const at::SymInt M = XQ.sym_size(0);
   const at::SymInt N = WQ.sym_size(0);
   auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
@@ -553,6 +571,8 @@ TORCH_LIBRARY_IMPL(mslk, Meta, m) {
   m.impl("f8f8f16_rowwise", f8f8f16_rowwise_meta);
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_meta);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8f16_rowwise_meta);
+  m.impl("i8i8bf16", i8i8bf16_meta);
+  m.impl("i8i8bf16_dynamic", i8i8bf16_dynamic_meta);
 #else
   m.impl("i8i8bf16", i8i8bf16_meta);
   m.impl("f4f4bf16", f4f4bf16_meta);
