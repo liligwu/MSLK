@@ -117,6 +117,9 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
   // i8i8bf16 / i8i8bf16_dynamic: dispatched to Python Triton kernels via
   // torch.library.impl registered in mslk/gemm/triton/int8_gemm.py.
+  // IMPORTANT: int8_gemm.py must be imported before these ops are called;
+  // the Python-side @torch.library.impl("mslk::i8i8bf16_dynamic", "CUDA")
+  // registration only takes effect after that import.
 #else
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);

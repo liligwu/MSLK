@@ -6,7 +6,7 @@
 
 # pyre-unsafe
 
-# ROCm INT8 GEMM via Triton (BACKLOG-G1 / MSLK-G1)
+# ROCm INT8 GEMM via Triton
 #
 # Implements:
 #   i8i8bf16         – static scale variant:  Y = XQ @ WQ.T * scale
@@ -19,6 +19,9 @@
 #
 # Layout: XQ [M, K] row-major, WQ [N, K] row-major (transposed in kernel), Y [M, N].
 # Accumulator: int32.  Output: bfloat16.
+
+import warnings
+from typing import Optional
 
 import torch
 import triton  # @manual
@@ -47,27 +50,131 @@ _NV_CONFIGS = [
     Config({"BLOCK_M": 16,  "BLOCK_N": 64,  "BLOCK_K": 128}, num_stages=5, num_warps=2),
 ]
 
-# AMD configs – tuned for CDNA3 (MI300X) / CDNA3+ (MI350X, gfx950).
-# waves_per_eu and matrix_instr_nonkdim follow the grouped_gemm.py AMD pattern.
-# BLOCK_K >= 64 recommended on CDNA3+ to utilise the larger LDS.
+# AMD configs – hand-pruned for CDNA3/3+ decode (small M) and prefill (large M).
+# Mirrors the NV list scale: cover 64/128/256 blocks with 64 and 128 BLOCK_K,
+# matching empirical sweet spots from fp8_gemm.py profiling.
 _AMD_CONFIGS = [
     triton.Config(
         {
-            "BLOCK_M": block_m,
-            "BLOCK_N": block_n,
-            "BLOCK_K": block_k,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+            "BLOCK_M": 128,
+            "BLOCK_N": 256,
+            "BLOCK_K": 128,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
         },
-        num_stages=num_stages,
-        num_warps=num_warps,
-    )
-    for block_m in [64, 128, 256]
-    for block_n in [64, 128, 256]
-    for block_k in [64, 128]
-    for num_stages in [1, 2]
-    for num_warps, waves_per_eu in [(4, 1), (8, 2), (16, 4)]
-    for matrix_instr_nonkdim in [16]
+        num_stages=2,
+        num_warps=8,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=2,
+        num_warps=8,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 64,
+            "BLOCK_N": 256,
+            "BLOCK_K": 128,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=2,
+        num_warps=8,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "BLOCK_K": 128,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=1,
+        num_warps=8,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 64,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=1,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=1,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 32,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=1,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=1,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 64,
+            "BLOCK_N": 32,
+            "BLOCK_K": 128,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 16,
+            "BLOCK_N": 64,
+            "BLOCK_K": 128,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=2,
+        num_warps=2,
+    ),
 ]
 
 
@@ -156,9 +263,9 @@ def _kernel_int8_gemm(
     acc_fp = acc.to(tl.float32)
     if USE_TENSOR_SCALE:
         scale = tl.load(scale_ptr).to(tl.float32)
+        acc_fp = acc_fp * scale
     else:
-        scale = scale_val.to(tl.float32)
-    acc_fp = acc_fp * scale
+        acc_fp = acc_fp * scale_val
 
     # Write output
     C = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
@@ -171,7 +278,12 @@ def _kernel_int8_gemm(
 # ---------------------------------------------------------------------------
 
 def _get_matmul_tune(M: int, N: int, K: int):
-    """Bucketed autotune keys – mirrors fp8_gemm.get_matmul_tune."""
+    """Bucketed autotune keys – mirrors fp8_gemm.get_matmul_tune.
+
+    N and K are passed through unbucketed: inference workloads typically have a
+    small number of fixed weight shapes, so cache thrash is not a concern.  If
+    that assumption breaks, bucket N/K the same way M is bucketed here.
+    """
     m_key = M if M < 256 else 256 + M // 1024
     return m_key, N, K
 
@@ -180,7 +292,7 @@ def _launch_int8_gemm(
     XQ: torch.Tensor,   # [M, K] int8
     WQ: torch.Tensor,   # [N, K] int8
     scale_val: float,
-    scale_tensor: torch.Tensor,  # ignored when use_tensor_scale=False
+    scale_tensor: Optional[torch.Tensor],
     use_tensor_scale: bool,
 ) -> torch.Tensor:
     assert XQ.dtype == torch.int8, f"XQ must be int8, got {XQ.dtype}"
@@ -202,12 +314,21 @@ def _launch_int8_gemm(
         triton.cdiv(N, meta["BLOCK_N"]),
     )
 
+    if use_tensor_scale:
+        assert scale_tensor is not None, "scale_tensor must be provided"
+        scale_ptr = scale_tensor
+    else:
+        # XQ is verified contiguous above, so its data_ptr is a valid device
+        # pointer.  Triton requires a real tensor here even though scale_ptr is
+        # never dereferenced when USE_TENSOR_SCALE=False.
+        scale_ptr = XQ
+
     _kernel_int8_gemm[grid](
         XQ,
         WQ,
         Y,
         scale_val,
-        scale_tensor,
+        scale_ptr,
         M,
         N,
         K,
@@ -240,8 +361,12 @@ def i8i8bf16_triton(
     Matches the CUDA signature:
         i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor
     """
-    dummy_scale_tensor = torch.empty((), dtype=torch.float32, device=XQ.device)
-    return _launch_int8_gemm(XQ, WQ, scale, dummy_scale_tensor, use_tensor_scale=False)
+    if split_k != 1:
+        warnings.warn(
+            "ROCm i8i8bf16_triton ignores split_k; pass split_k=1 to silence.",
+            stacklevel=2,
+        )
+    return _launch_int8_gemm(XQ, WQ, scale, None, use_tensor_scale=False)
 
 
 def i8i8bf16_dynamic_triton(
@@ -255,6 +380,11 @@ def i8i8bf16_dynamic_triton(
     Matches the CUDA signature:
         i8i8bf16_dynamic(Tensor XQ, Tensor WQ, Tensor scale, int split_k=1) -> Tensor
     """
+    if split_k != 1:
+        warnings.warn(
+            "ROCm i8i8bf16_dynamic_triton ignores split_k; pass split_k=1 to silence.",
+            stacklevel=2,
+        )
     assert scale.dtype == torch.float32, f"scale must be float32, got {scale.dtype}"
     return _launch_int8_gemm(XQ, WQ, 0.0, scale, use_tensor_scale=True)
 
@@ -273,6 +403,8 @@ def _register_rocm_ops() -> None:
     """
     import torch.library  # noqa: F401
 
+    # PyTorch HIP builds surface the CUDA dispatch key for GPU kernels; keep
+    # this on "CUDA" until PyTorch exposes a stable HIP/PrivateUse key.
     @torch.library.impl("mslk::i8i8bf16", "CUDA")
     def _i8i8bf16_impl(
         XQ: torch.Tensor,
@@ -297,7 +429,10 @@ def _register_rocm_ops() -> None:
 if torch.version.hip is not None:
     try:
         _register_rocm_ops()
-    except Exception:
+    except Exception as exc:
         # If mslk C++ library isn't loaded yet (e.g. unit-test environments
         # that stub the schema), registration is deferred to the caller.
-        pass
+        warnings.warn(
+            f"Deferring ROCm i8i8 registration until later import: {exc}",
+            stacklevel=2,
+        )

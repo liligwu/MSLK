@@ -2821,11 +2821,11 @@ class MX8MX4Tests(unittest.TestCase):
 
 
 def _supports_int8_triton() -> bool:
-    """True on ROCm (any CDNA GPU) or CUDA SM80+."""
+    """True on CUDA SM80+ or ROCm CDNA3 (gfx942) / CDNA3+ (gfx950)."""
     if not torch.cuda.is_available():
         return False
     if torch.version.hip:
-        return True
+        return evaluate_gfx_arch_in(["gfx942", "gfx950"])
     return evaluate_cuda_compute_capability(8)
 
 
