@@ -253,8 +253,8 @@ def _kernel_int8_gemm(
         a = tl.load(A, mask=mask_m[:, None] & k_mask[None, :], other=0)
         b = tl.load(B, mask=mask_n[:, None] & k_mask[None, :], other=0)
 
-        # tl.dot requires the rhs to be [K, N]; transpose b tile in-register.
-        acc += tl.dot(a, b.T, out_dtype=tl.int32)
+        # tl.dot requires rhs [K, N]; b is loaded [N, K] so transpose in-register.
+        acc = tl.dot(a, b.T, acc, out_dtype=tl.int32)
 
         A += BLOCK_K * stride_ak
         B += BLOCK_K * stride_bk
